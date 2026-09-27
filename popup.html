@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Site ZIP Collector</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="mark">SZ</div>
+        <div>
+          <h1>Site ZIP Collector</h1>
+          <p>Choose pages and save their accessible assets.</p>
+        </div>
+      </header>
+
+      <button id="scan" class="primary">Scan links on this page</button>
+
+      <section id="results" hidden>
+        <div class="toolbar">
+          <input id="filter" type="search" placeholder="Filter pages..." autocomplete="off">
+          <span id="count">0 selected</span>
+        </div>
+        <div class="actions">
+          <button id="all" class="text-button">Select all</button>
+          <button id="none" class="text-button">Clear</button>
+          <button id="onePerTemplate" class="text-button">One per template</button>
+          <label class="toggle"><input type="checkbox" id="groupToggle" checked> Group</label>
+        </div>
+        <div id="links" class="link-list"></div>
+
+        <div class="add-url-row">
+          <input id="addUrlInput" type="url" placeholder="Add a page URL not listed above..." autocomplete="off">
+          <button id="addUrl" class="text-button">Add</button>
+        </div>
+
+        <div class="options">
+          <div class="options-title">Capture options</div>
+          <label class="opt"><input type="checkbox" id="optRendered" checked> Rendered HTML (after JavaScript) &mdash; best for cloning</label>
+          <label class="opt"><input type="checkbox" id="optScreenshot" checked> Full-page screenshot (PNG) &mdash; opens each page briefly</label>
+          <label class="opt"><input type="checkbox" id="optRaw"> Also save raw server HTML</label>
+        </div>
+
+        <button id="download" class="primary">Download selected pages as ZIP</button>
+      </section>
+
+      <section id="status" class="status" hidden>
+        <div class="status-row">
+          <span id="statusText">Preparing...</span>
+          <span id="statusPercent">0%</span>
+        </div>
+        <div class="progress"><div id="progressBar"></div></div>
+      </section>
+
+      <p id="error" class="error" hidden></p>
+      <p class="note">Use only on websites you own or have permission to archive.</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

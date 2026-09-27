@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Site ZIP Collector",
+  "version": "2.0.0",
+  "description": "Capture rendered pages, assets, and full-page screenshots into one ZIP archive built for AI-assisted website analysis and cloning.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Site ZIP Collector",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
