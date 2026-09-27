@@ -2,15 +2,6 @@
 
 const encoder = new TextEncoder();
 
-function bytesToBase64(bytes) {
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
 function report(text, percent, done = false, error = "") {
   const payload = { type: "ARCHIVE_PROGRESS", text, percent, done, error };
   try {
@@ -53,53 +44,6 @@ function normalizeUrl(value, base) {
   } catch {
     return null;
   }
-}
-
-// Parses a srcset attribute into candidates. A URL token ends at whitespace,
-// not at a comma, so splitting on "," corrupts data: URIs (whose base64 payload
-// contains commas) and URLs that carry a comma in the query string.
-function parseSrcset(value) {
-  const candidates = [];
-  const isSpace = (ch) => ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
-  let i = 0;
-
-  while (i < value.length) {
-    while (i < value.length && (isSpace(value[i]) || value[i] === ",")) i += 1;
-    if (i >= value.length) break;
-
-    const start = i;
-    while (i < value.length && !isSpace(value[i])) i += 1;
-    const token = value.slice(start, i);
-
-    if (token.endsWith(",")) {
-      const bare = token.replace(/,+$/, "");
-      if (bare) candidates.push({ url: bare, descriptor: "" });
-      continue;
-    }
-
-    let descriptor = "";
-    let depth = 0;
-    while (i < value.length) {
-      const ch = value[i];
-      if (ch === "(") depth += 1;
-      else if (ch === ")" && depth > 0) depth -= 1;
-      else if (ch === "," && depth === 0) {
-        i += 1;
-        break;
-      }
-      descriptor += ch;
-      i += 1;
-    }
-    if (token) candidates.push({ url: token, descriptor: descriptor.trim() });
-  }
-  return candidates;
-}
-
-function formatSrcset(candidates) {
-  return candidates
-    .filter((candidate) => candidate.url)
-    .map((candidate) => (candidate.descriptor ? `${candidate.url} ${candidate.descriptor}` : candidate.url))
-    .join(", ");
 }
 
 function contentExtension(contentType) {
@@ -172,7 +116,10 @@ async function archivePage(page, folder, selectedPages, files, failures) {
     baseNode = documentNode.createElement("base");
     documentNode.head.prepend(baseNode);
   }
-  baseNode.setAttribute("href", "./");
+  // Point at the saved file itself, not its folder: "assets/x" still resolves
+  // into the folder, and "#top" stays in-document instead of navigating to
+  // the folder URL.
+  baseNode.setAttribute("href", "./index.html");
 
   async function saveAsset(rawUrl, baseUrl = declaredBase) {
     const absolute = normalizeUrl(rawUrl, baseUrl);
@@ -345,19 +292,17 @@ function dosTimeDate(date = new Date()) {
   };
 }
 
-function concatBytes(chunks) {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return output;
-}
-
 const U16_MAX = 0xffff;
 const U32_MAX = 0xffffffff;
+
+// Formats that are already compressed; deflating them again burns CPU for
+// no gain.
+const STORED_EXTENSIONS = /\.(png|jpe?g|gif|webp|avif|woff2?|mp4|webm|mp3|ogg|zip|gz|br)$/i;
+
+async function deflateRaw(data) {
+  const stream = new Blob([data]).stream().pipeThrough(new CompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
 
 // ZIP64 extra field (header id 0x0001) carrying 64-bit sizes and offsets.
 function zip64ExtraField(values) {
@@ -369,72 +314,82 @@ function zip64ExtraField(values) {
   return field;
 }
 
-function zipStore(files) {
+// Builds the archive as a list of chunks rather than one contiguous buffer, so
+// the caller can hand them straight to a Blob without another full copy.
+async function zipArchive(files) {
   const stamp = dosTimeDate();
-  const entries = [];
+  const chunks = [];
+  const centralChunks = [];
   let offset = 0;
 
   for (const file of files) {
     const name = encoder.encode(file.name.replace(/^\/+/, ""));
     const data = file.data instanceof Uint8Array ? file.data : encoder.encode(String(file.data));
     if (data.length > U32_MAX) throw new Error("A single archive entry exceeds the 4 GB ZIP limit.");
-    entries.push({ name, data, crc: crc32(data), localOffset: offset });
-    offset += 30 + name.length + data.length;
-  }
 
-  const localChunks = [];
-  const centralChunks = [];
+    let method = 0;
+    let stored = data;
+    if (data.length > 64 && !STORED_EXTENSIONS.test(file.name)) {
+      const deflated = await deflateRaw(data);
+      if (deflated.length < data.length) {
+        method = 8;
+        stored = deflated;
+      }
+    }
+    const crc = crc32(data);
+    const localOffset = offset;
 
-  for (const entry of entries) {
-    const local = new Uint8Array(30 + entry.name.length);
+    const local = new Uint8Array(30 + name.length);
     const lv = new DataView(local.buffer);
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(4, 20, true);
     lv.setUint16(6, 0x0800, true);
-    lv.setUint16(8, 0, true);
+    lv.setUint16(8, method, true);
     lv.setUint16(10, stamp.time, true);
     lv.setUint16(12, stamp.date, true);
-    lv.setUint32(14, entry.crc, true);
-    lv.setUint32(18, entry.data.length, true);
-    lv.setUint32(22, entry.data.length, true);
-    lv.setUint16(26, entry.name.length, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, stored.length, true);
+    lv.setUint32(22, data.length, true);
+    lv.setUint16(26, name.length, true);
     lv.setUint16(28, 0, true);
-    local.set(entry.name, 30);
-    localChunks.push(local, entry.data);
+    local.set(name, 30);
+    chunks.push(local, stored);
+    offset += local.length + stored.length;
 
-    const wide = entry.data.length > U32_MAX || entry.localOffset > U32_MAX;
+    const wide = localOffset > U32_MAX;
     const extra = wide
-      ? zip64ExtraField([BigInt(entry.data.length), BigInt(entry.data.length), BigInt(entry.localOffset)])
+      ? zip64ExtraField([BigInt(data.length), BigInt(stored.length), BigInt(localOffset)])
       : new Uint8Array(0);
-    const central = new Uint8Array(46 + entry.name.length + extra.length);
+    const central = new Uint8Array(46 + name.length + extra.length);
     const cv = new DataView(central.buffer);
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(4, 20, true);
     cv.setUint16(6, wide ? 45 : 20, true);
     cv.setUint16(8, 0x0800, true);
-    cv.setUint16(10, 0, true);
+    cv.setUint16(10, method, true);
     cv.setUint16(12, stamp.time, true);
     cv.setUint16(14, stamp.date, true);
-    cv.setUint32(16, entry.crc, true);
-    cv.setUint32(20, wide ? U32_MAX : entry.data.length, true);
-    cv.setUint32(24, wide ? U32_MAX : entry.data.length, true);
-    cv.setUint16(28, entry.name.length, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, wide ? U32_MAX : stored.length, true);
+    cv.setUint32(24, wide ? U32_MAX : data.length, true);
+    cv.setUint16(28, name.length, true);
     cv.setUint16(30, extra.length, true);
     cv.setUint16(32, 0, true);
     cv.setUint16(34, 0, true);
     cv.setUint16(36, 0, true);
     cv.setUint32(38, 0, true);
-    cv.setUint32(42, wide ? U32_MAX : entry.localOffset, true);
-    central.set(entry.name, 46);
-    central.set(extra, 46 + entry.name.length);
+    cv.setUint32(42, wide ? U32_MAX : localOffset, true);
+    central.set(name, 46);
+    central.set(extra, 46 + name.length);
     centralChunks.push(central);
   }
 
+  const centralOffset = offset;
   const centralSize = centralChunks.reduce((sum, chunk) => sum + chunk.length, 0);
   // Past these limits the classic 16/32-bit end-of-central-directory fields
   // cannot describe the archive, so a ZIP64 trailer is required.
-  const needsZip64 = entries.length > U16_MAX || centralSize > U32_MAX || offset > U32_MAX;
-  const chunks = [...localChunks, ...centralChunks];
+  const needsZip64 = centralChunks.length > U16_MAX || centralSize > U32_MAX || centralOffset > U32_MAX;
+  chunks.push(...centralChunks);
 
   if (needsZip64) {
     const record = new Uint8Array(56);
@@ -445,18 +400,19 @@ function zipStore(files) {
     rv.setUint16(14, 45, true);
     rv.setUint32(16, 0, true);
     rv.setUint32(20, 0, true);
-    rv.setBigUint64(24, BigInt(entries.length), true);
-    rv.setBigUint64(32, BigInt(entries.length), true);
+    rv.setBigUint64(24, BigInt(centralChunks.length), true);
+    rv.setBigUint64(32, BigInt(centralChunks.length), true);
     rv.setBigUint64(40, BigInt(centralSize), true);
-    rv.setBigUint64(48, BigInt(offset), true);
+    rv.setBigUint64(48, BigInt(centralOffset), true);
     chunks.push(record);
 
     const locator = new Uint8Array(20);
     const gv = new DataView(locator.buffer);
     gv.setUint32(0, 0x07064b50, true);
     gv.setUint32(4, 0, true);
-    gv.setBigUint64(8, BigInt(offset + centralSize), true);
-    gv.setUint32(16, 0, true);
+    gv.setBigUint64(8, BigInt(centralOffset + centralSize), true);
+    // Total number of disks; a single-file archive is one disk, not zero.
+    gv.setUint32(16, 1, true);
     chunks.push(locator);
   }
 
@@ -465,13 +421,13 @@ function zipStore(files) {
   ev.setUint32(0, 0x06054b50, true);
   ev.setUint16(4, 0, true);
   ev.setUint16(6, 0, true);
-  ev.setUint16(8, needsZip64 ? U16_MAX : entries.length, true);
-  ev.setUint16(10, needsZip64 ? U16_MAX : entries.length, true);
+  ev.setUint16(8, needsZip64 ? U16_MAX : centralChunks.length, true);
+  ev.setUint16(10, needsZip64 ? U16_MAX : centralChunks.length, true);
   ev.setUint32(12, needsZip64 ? U32_MAX : centralSize, true);
-  ev.setUint32(16, needsZip64 ? U32_MAX : offset, true);
+  ev.setUint32(16, needsZip64 ? U32_MAX : centralOffset, true);
   ev.setUint16(20, 0, true);
   chunks.push(end);
-  return concatBytes(chunks);
+  return chunks;
 }
 
 function buildReadme(options) {
@@ -517,7 +473,15 @@ const session = {
   processed: 0
 };
 
+let archiveUrl = "";
+
+function revokeArchiveUrl() {
+  if (archiveUrl) URL.revokeObjectURL(archiveUrl);
+  archiveUrl = "";
+}
+
 function resetSession(options, siteTitle, urls) {
+  revokeArchiveUrl();
   session.active = true;
   session.options = options || {};
   session.siteTitle = siteTitle || "website";
@@ -600,7 +564,7 @@ async function finalizeSession() {
   session.files.unshift({ name: "README.txt", data: encoder.encode(buildReadme(session.options)) });
 
   report("Building ZIP file", 92);
-  const zipBytes = zipStore(session.files);
+  const zipChunks = await zipArchive(session.files);
   const firstUrl = session.urls[0] || "";
   let hostname = "website";
   try {
@@ -610,12 +574,19 @@ async function finalizeSession() {
   }
   const filename = `${safeSegment(session.siteTitle || hostname, hostname)}-site-archive.zip`;
 
+  // A blob: URL instead of a base64 data: URL: Chrome refuses to download
+  // data: URLs past a few tens of MB, and base64 inflated the payload by 33%.
+  // The URL must outlive this call because the save dialog may stay open, so
+  // it is revoked once the download ends or when the next archive starts.
+  revokeArchiveUrl();
+  archiveUrl = URL.createObjectURL(new Blob(zipChunks, { type: "application/zip" }));
   const downloadResponse = await chrome.runtime.sendMessage({
     type: "SAVE_ARCHIVE",
     filename,
-    base64: bytesToBase64(zipBytes)
+    url: archiveUrl
   });
   if (!downloadResponse?.ok) {
+    revokeArchiveUrl();
     throw new Error(downloadResponse?.error || "Download failed.");
   }
 
@@ -631,6 +602,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "ARCHIVE_START") {
     resetSession(message.options || {}, message.siteTitle || "website", message.urls || []);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message.type === "REVOKE_ARCHIVE_URL") {
+    if (message.url === archiveUrl) revokeArchiveUrl();
     sendResponse({ ok: true });
     return true;
   }

@@ -67,7 +67,7 @@ async function ensureContentScript(tabId) {
   } catch {
     // fall through to inject
   }
-  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["srcset.js", "content.js"] });
   await sleep(300);
   await sendToTab(tabId, { type: "PING" }, 5000);
 }
@@ -235,12 +235,24 @@ async function runCapture(urls, siteTitle, options) {
   });
 }
 
+// The offscreen document owns the archive's blob: URL; once Chrome has finished
+// reading it (or the user cancelled the save dialog) it can be released.
+function releaseArchiveUrlWhenDone(downloadId, url) {
+  const listener = (delta) => {
+    if (delta.id !== downloadId || !delta.state) return;
+    if (delta.state.current !== "complete" && delta.state.current !== "interrupted") return;
+    chrome.downloads.onChanged.removeListener(listener);
+    sendToOffscreen({ type: "REVOKE_ARCHIVE_URL", url }).catch(() => {});
+  };
+  chrome.downloads.onChanged.addListener(listener);
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "SAVE_ARCHIVE") {
     (async () => {
       try {
-        const dataUrl = `data:application/zip;base64,${message.base64 || ""}`;
-        await chrome.downloads.download({ url: dataUrl, filename: message.filename, saveAs: true });
+        const downloadId = await chrome.downloads.download({ url: message.url, filename: message.filename, saveAs: true });
+        releaseArchiveUrlWhenDone(downloadId, message.url);
         sendResponse({ ok: true });
       } catch (error) {
         sendResponse({ ok: false, error: error.message || String(error) });
